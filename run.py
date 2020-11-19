@@ -9,7 +9,6 @@ import platform
 import bisect
 import numpy as np
 
-
 class Speech(TFBase):
   def __init__(self):
     super(Speech, self).__init__()
@@ -39,8 +38,11 @@ class Speech(TFBase):
     self.training_dir = "obama_data/"
 
     self.fps = 29.97
+    #read data
     self.loadData()
+    #load model
     self.model = self.standardL2Model
+
 
     self.audioinput = len(self.args.input2)
     if (self.audioinput):
@@ -49,6 +51,7 @@ class Speech(TFBase):
     if len(self.args.input):
       self.test()
     else:
+      #no input ,do training
       self.train()
 
   def createInputFeature(self, audio, audiodiff, timestamps, startframe, nframe):
@@ -56,9 +59,9 @@ class Speech(TFBase):
     endAudio = bisect.bisect_right(timestamps, (startframe + nframe - 2) / self.fps)
 
     inp = np.concatenate((audio[startAudio:endAudio, :-1], audiodiff[startAudio:endAudio, :]), axis=1)
-    return startAudio, endAudio, inp 
+    return startAudio, endAudio, inp
 
-
+   #read data, input from audio (.wav.npy),label from (.bin)
   def preprocess(self, save_dir):
     files = [x.split("\t")[0].strip() for x in open(self.training_dir + "processed_fps.txt", "r").readlines()]
 
@@ -72,14 +75,18 @@ class Speech(TFBase):
 
       dnums = sorted([os.path.basename(x) for x in glob.glob(self.training_dir + files[i] + "}}*")])
 
-      audio = np.load(self.training_dir + "/audio/normalized-cep13/" + files[i] + ".wav.npy") 
+      #!!! audio file in obama_data/audio/normalized-cep13 , seems the audio file is saved as .npy
+      # audio shape (*,15)
+      audio = np.load(self.training_dir + "/audio/normalized-cep13/" + files[i] + ".wav.npy")
+      # The first 14 features are different between frames
       audiodiff = audio[1:,:-1] - audio[:-1, :-1]
 
-      print files[i], audio.shape, tp
+      print(files[i], audio.shape, tp)
       timestamps = audio[:, -1]
 
       for dnum in dnums:
-        print dnum 
+        print('dnum: ',dnum)
+        # read feature shape (*,20)
         fids = readCVFloatMat(self.training_dir + dnum + "/frontalfidsCoeff_unrefined.bin")
         if not os.path.exists(self.training_dir + dnum + "/startframe.txt"):
           startframe = 1
@@ -87,6 +94,7 @@ class Speech(TFBase):
           startframe = readSingleInt(self.training_dir + dnum + "/startframe.txt")
         nframe = readSingleInt(self.training_dir + dnum + "/nframe.txt")
 
+        #inp feature = audio first 14 feature concat audiodiff 14 feature
         startAudio, endAudio, inp = self.createInputFeature(audio, audiodiff, timestamps, startframe, nframe)
 
         outp = np.zeros((endAudio - startAudio, fids.shape[1]), dtype=np.float32)
@@ -97,12 +105,14 @@ class Speech(TFBase):
             leftmark += 1
           t = (audiotime - (startframe - 1 + leftmark) / self.fps) * self.fps;
           outp[aud - startAudio, :] = fids[leftmark, :] * (1 - t) + fids[min(len(fids) - 1, leftmark + 1), :] * t;
-            
+
         inps[tp].append(inp)
         outps[tp].append(outp)
 
     return (inps, outps)
 
+
+  #build model
   def standardL2Model(self, args, infer=False):
     if infer:
       args.batch_size = 1
@@ -118,7 +128,7 @@ class Speech(TFBase):
     else:
       self.network = tf.nn.rnn_cell.MultiRNNCell([cell] * args.num_layers, state_is_tuple=True)
 
-
+    #input/output placeholder
     self.input_data = tf.placeholder(dtype=tf.float32, shape=[None, args.seq_length, self.dimin])
     self.target_data = tf.placeholder(dtype=tf.float32, shape=[None, args.seq_length, self.dimout])
     self.initial_state = self.network.zero_state(batch_size=args.batch_size, dtype=tf.float32)
@@ -130,6 +140,7 @@ class Speech(TFBase):
     inputs = tf.split(value=self.input_data, num_or_size_splits=args.seq_length, axis=1)
     inputs = [tf.squeeze(input_, [1]) for input_ in inputs]
 
+    #use enclosed model in tensorflow contrib, seq2seq seems like encoding-decoding model
     outputs, states = tf.contrib.legacy_seq2seq.rnn_decoder(inputs, self.initial_state, self.network, loop_function=None, scope='rnnlm')
 
     output = tf.reshape(tf.concat(outputs, axis=1), [-1, args.rnn_size])
@@ -138,7 +149,12 @@ class Speech(TFBase):
     self.output = output
 
     flat_target_data = tf.reshape(self.target_data,[-1, self.dimout])
-        
+
+    # when training
+    # self.cost and self.train_op are calculated in sess.run() in utils.py  "res = sess.run(fetches, feed_dict)"
+    # when test
+    # only calculate self.output in  run.py "def sample_audioinput "
+
     lossfunc = tf.reduce_sum(tf.squared_difference(flat_target_data, output))
     #lossfunc = tf.reduce_sum(tf.abs(flat_target_data - output))
     self.cost = lossfunc / (args.batch_size * args.seq_length * self.dimout)
@@ -149,19 +165,21 @@ class Speech(TFBase):
     optimizer = tf.train.AdamOptimizer(self.lr)
     self.train_op = optimizer.apply_gradients(zip(grads, tvars))
 
+  # general operation of temporal model - delay 20 frames
   def load_preprocessed(self, inps, outps):
     newinps = {"training": [], "validation": []}
     newoutps = {"training": [], "validation": []}
     for key in newinps:
       for i in range(len(inps[key])):
-        if len(inps[key][i]) - self.args.timedelay >= (self.args.seq_length+2):
+        if len(inps[key][i]) - self.args.timedelay >= (self.args.seq_length+2): #self.args.seq_length = 100 ; self.args.timedelay =20
           if self.args.timedelay > 0:
+            # general operation of temporal model  make the audio delay???
             newinps[key].append(inps[key][i][self.args.timedelay:])
             newoutps[key].append(outps[key][i][:-self.args.timedelay])
           else:
             newinps[key].append(inps[key][i])
             newoutps[key].append(outps[key][i])
-    print "load preprocessed", len(newinps), len(newoutps)
+    print("load preprocessed", len(newinps), len(newoutps))
     return newinps, newoutps
 
 
@@ -173,7 +191,7 @@ class Speech(TFBase):
 
   def sample_audioinput(self, sess, args, data, pt):
     meani, stdi, meano, stdo = data["inputmean"], data["inputstd"], data["outputmean"], data["outputstd"]
-    audio = np.load(self.training_dir + "/audio/normalized-cep13/" + self.args.input2 + ".wav.npy") 
+    audio = np.load(self.training_dir + "/audio/normalized-cep13/" + self.args.input2 + ".wav.npy")
 
     audiodiff = audio[1:,:-1] - audio[:-1, :-1]
     timestamps = audio[:, -1]
@@ -189,7 +207,7 @@ class Speech(TFBase):
       os.mkdir("results/")
 
     f = open("results/" + self.args.input2 + "_" + args.save_dir + ".txt", "w")
-    print "output to results/" + self.args.input2 + "_" + args.save_dir + ".txt"
+    print("output to results/" + self.args.input2 + "_" + args.save_dir + ".txt")
     f.write("%d %d\n" % (len(inp), self.dimout + 1))
     fetches = []
     fetches.append(self.output)
@@ -207,6 +225,7 @@ class Speech(TFBase):
       res = sess.run(fetches, feed_dict)
       output = res[0] * stdo + meano
 
+      #use time delay again
       if i >= args.timedelay:
         shifttime = times[i - args.timedelay]
       else:
@@ -214,7 +233,7 @@ class Speech(TFBase):
       f.write(("%f " % shifttime) + " ".join(["%f" % x for x in output[0]]) + "\n")
 
       state_flat = res[1:]
-      state = [state_flat[i:i+2] for i in range(0, len(state_flat), 2)] 
+      state = [state_flat[i:i+2] for i in range(0, len(state_flat), 2)]
     f.close()
 
 
